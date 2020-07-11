@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 import argparse
+from position_encoding import PositionEmbeddingSine
 
 
 class Transformer(nn.Module):
@@ -14,7 +15,9 @@ class Transformer(nn.Module):
                  activation="relu", normalize_before=False,
                  return_intermediate_dec=False):
         super().__init__()
+        self.pos_encoder = PositionEmbeddingSine()# TODO: positional encoding, what is hidden dim?
 
+        # TODO: also seems that encoder/decoder take sequential info, can you transform this into fmap input?
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
@@ -121,13 +124,13 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  ffn_layer="conv", norm="spectral", activation="relu", normalize_before=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = MultiHeadAttention(d_model, nhead, dropout=dropout) # TODO: how to edit MultiHeadAttention?
         # Implementation of Feedforward model
         self.ffn1 = nn.Conv2d(d_model, dim_feedforward) if ffn_layer=="conv" else nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.ffn2 = nn.Conv2d(d_model, dim_feedforward) if ffn_layer=="conv" else nn.Linear(dim_feedforward, d_model)
 
-        self.norm1 = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model) # nn.SpectralNorm()
+        self.norm1 = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model) # TODO: what does spectral normalization do? nn.SpectralNorm()
         self.norm2 = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -179,18 +182,18 @@ class TransformerEncoderLayer(nn.Module):
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+                 ffn_layer=None, norm=None, activation="relu", normalize_before=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = MultiHeadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = MultiHeadAttention(d_model, nhead, dropout=dropout)
         # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.ffn1 = nn.Conv2d(d_model, dim_feedforward, 1) if ffn_layer=="conv" else nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.ffn2 = nn.Conv2d(d_model, dim_feedforward, 1) if ffn_layer=="conv" else nn.Linear(dim_feedforward, d_model)
 
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
+        self.norm1 = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model) # TODO: what does spectral normalization do? nn.SpectralNorm()
+        self.norm2 = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model)
+        self.norm3 = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -219,7 +222,7 @@ class TransformerDecoderLayer(nn.Module):
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt2 = self.ffn2(self.dropout(self.activation(self.ffn1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
@@ -260,47 +263,79 @@ class TransformerDecoderLayer(nn.Module):
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
 
-class MultiheadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None):
-        super(MultiheadAttention, self).__init__()
-        self.embed_dim = embed_dim
-        self.kdim = kdim if kdim is not None else embed_dim
-        self.vdim = vdim if vdim is not None else embed_dim
-        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+class MultiHeadAttention(nn.Module):
+    ''' Multi-Head Attention module '''
 
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.head_dim = embed_dim // num_heads
-        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+    def __init__(self, n_head, d_model, d_k=None, d_v=None, weight_layer="conv", norm="spectral", dropout=0.1):
+        super().__init__()
 
-        if self._qkv_same_embed_dim is False:
-            self.q_proj_weight = Parameter(torch.Tensor(embed_dim, embed_dim))
-            self.k_proj_weight = Parameter(torch.Tensor(embed_dim, self.kdim))
-            self.v_proj_weight = Parameter(torch.Tensor(embed_dim, self.vdim))
-            self.register_parameter('in_proj_weight', None)
-        else:
-            self.in_proj_weight = Parameter(torch.empty(3 * embed_dim, embed_dim))
-            self.register_parameter('q_proj_weight', None)
-            self.register_parameter('k_proj_weight', None)
-            self.register_parameter('v_proj_weight', None)
+        self.n_head = n_head
+        d_k = d_k if d_k else d_model
+        d_v = d_v if d_v else d_model
+        self.d_k = d_k
+        self.d_v = d_v
 
-        if bias:
-            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim))
-        else:
-            self.register_parameter('in_proj_bias', None)
-        self.out_proj = _LinearWithBias(embed_dim, embed_dim)
+        self.w_qs = nn.Conv2d(d_model, n_head * self.d_k, 1) if weight_layer == "conv" else nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_ks = nn.Conv2d(d_model, n_head * d_k, 1) if weight_layer == "conv" else nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_vs = nn.Conv2d(d_model, n_head * d_v, 1) if weight_layer == "conv" else nn.Linear(d_model, n_head * d_v, bias=False)
+        self.fc = nn.Conv2d(n_head * d_v, d_model, 1) if weight_layer == "conv" else nn.Linear(n_head * d_v, d_model, bias=False)
 
-        if add_bias_kv:
-            self.bias_k = Parameter(torch.empty(1, 1, embed_dim))
-            self.bias_v = Parameter(torch.empty(1, 1, embed_dim))
-        else:
-            self.bias_k = self.bias_v = None
+        self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5)
 
-        self.add_zero_attn = add_zero_attn
-
-        self._reset_parameters()    
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.utils.spectral_norm if norm=="spectral" else nn.LayerNorm(d_model, eps=1e-6)
 
 
+    def forward(self, q, k, v, mask=None):
+
+        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
+        sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
+
+        residual = q
+
+        # Pass through the pre-attention projection: b x lq x (n*dv)
+        # Separate different heads: b x lq x n x dv
+        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
+        k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
+        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
+
+        # Transpose for attention dot product: b x n x lq x dv
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1)   # For head axis broadcasting.
+
+        q, attn = self.attention(q, k, v, mask=mask)
+
+        # Transpose to move the head dimension back: b x lq x n x dv
+        # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
+        q = q.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
+        q = self.dropout(self.fc(q))
+        q += residual
+
+        q = self.layer_norm(q)
+
+        return q, attn
+
+class ScaledDotProductAttention(nn.Module):
+    ''' Scaled Dot-Product Attention '''
+
+    def __init__(self, temperature, attn_dropout=0.1):
+        super().__init__()
+        self.temperature = temperature
+        self.dropout = nn.Dropout(attn_dropout)
+
+    def forward(self, q, k, v, mask=None):
+
+        attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
+
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, -1e9)
+
+        attn = self.dropout(F.softmax(attn, dim=-1))
+        output = torch.matmul(attn, v)
+
+        return output, attn
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -362,7 +397,7 @@ def get_args_parser():
                         help="Number of query slots") # TODO: what is the default value?
     parser.add_argument('--pre_norm', action='store_true')
     parser.add_argument("--ffn_layer", default="conv", type=str, choices=("conv", "linear"),
-                        help="Layers used in Feed Forward Network")
+                        help="LaTransformeryers used in Feed Forward Network")
 
 
     """# * Segmentation
@@ -422,3 +457,13 @@ def _get_activation_fn(activation):
     if activation == "elu":
         return F.elu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
+
+
+def main():
+    device = torch.device('cpu')
+    t = Transformer().to(device)
+    
+    print("Transformer")
+    print(t)
+    
+main()
